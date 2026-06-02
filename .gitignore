@@ -1,0 +1,32 @@
+# ---- Python キャッシュ ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- Claude Code ローカル設定（許可コマンド・ローカルパスを含む） ----
+.claude/
+
+# ---- バックアップ ----
+*.bak-*
+*.before-*
+*.bak
+
+# ---- ログ ----
+*.log
+logs/
+
+# ---- 運用ノート・設計書（マシン内部情報・SSH・FD/LANG 知見を含む） ----
+docs/
+
+# ---- 環境依存・機密 ----
+config.yaml
+.env
+*.local.json
+
+# ---- データ・生成物（別ディレクトリだが念のため） ----
+raw/
+wiki/
+outputs/
+
+# macOS が自動生成するゴミ
+.DS_Store
