@@ -11,7 +11,9 @@ Daily Digest Generator
 """
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -37,6 +39,13 @@ SCORE_MAX = 130  # 同点を減らすため上限を 100 → 130 に拡大
 MIN_BODY_LEN_FOR_IDEA = 200  # ブログネタ候補にする最低本文長（文字）
 DIGEST_WINDOW_HOURS = 24  # 直近 N 時間に保存された記事を「今日の新着」とみなす
 
+# ---------- α（SE価値判定）設定 ----------
+ALPHA_BETA_TOP_N = 12         # β足切り：αに渡す上位件数
+ALPHA_FINAL_N = 5             # α が選ぶ最終件数
+ALPHA_SCRIPT = HOME / "my-scripts" / "score_se_value.sh"
+ALPHA_BODY_CHARS = 300        # 各記事の本文をプロンプトに載せる際の冒頭文字数
+ALPHA_TIMEOUT_SEC = 180       # score_se_value.sh のタイムアウト
+
 
 # ---------- データ ----------
 
@@ -51,6 +60,8 @@ class Article:
     body: str = ""
     score: int = 0
     score_reasons: list[str] = field(default_factory=list)
+    se_rank: int = 0          # α が付けた SE価値ランク（1が最良、0は未判定）
+    se_reason: str = ""       # α が付けた判定理由
 
 
 @dataclass
@@ -190,6 +201,99 @@ def score_article(art: Article, profile: InterestProfile) -> None:
 
     art.score = max(0, min(SCORE_MAX, score))
     art.score_reasons = reasons
+
+
+# ---------- α（SE価値意味判定） ----------
+
+def build_alpha_prompt(articles: list["Article"]) -> str:
+    """β通過記事から α判定用プロンプトを組み立てる。
+    記事番号(id)は 1始まりで、articles のインデックス+1 に対応させる。"""
+    header = (
+        "あなたは「SE→AI活用開発に移行しようとしている技術者」向けの情報"
+        "キュレーターである。以下の記事リストを、その読者にとっての価値で評価し、"
+        "上位5本を選んで順位づけせよ。\n\n"
+        "# 評価軸（この順で重視する）\n"
+        "1. 実装可能性: ソロのエンジニアが今週、自分の手で試せる具体性があるか。"
+        "概念論・ポエム・宣伝は低評価。\n"
+        "2. 近道性: SE→AI活用開発の移行で、数か月分の試行錯誤を省ける情報か。"
+        "「やり方の一般論」でなく「動く成果・具体的手順」を高評価。\n"
+        "3. 陳腐化耐性: 半年後も価値が残るか。流行先行・一過性の話題は減点。\n"
+        "4. 着手喚起力: 上記1〜2を満たす記事に限り、読者が「自分も今日試そう」と"
+        "具体的な次の一歩を描けるものを加点。※単に気分を高揚させるだけ・"
+        "危機感を煽るだけの記事は加点しない。\n\n"
+        "# 出力形式（厳守）\n"
+        "JSON配列のみを出力する。前後に説明文・コードブロック記号は一切付けない。"
+        "各要素は以下のキーを持つ:\n"
+        '  "id": 入力で与えた記事番号（整数）\n'
+        '  "rank": 1〜5の順位（1が最良）\n'
+        '  "reason": なぜこの順位か、移行期SE視点で40字以内の日本語\n'
+        "上位5本のみ。6本目以降は出力しない。\n\n"
+        "# 入力記事\n"
+    )
+    blocks = []
+    for i, art in enumerate(articles, 1):
+        body_head = (art.body or "").strip().replace("\n", " ")[:ALPHA_BODY_CHARS]
+        blocks.append(f"[{i}] タイトル: {art.title}\n冒頭: {body_head}")
+    return header + "\n\n".join(blocks) + "\n"
+
+
+def rank_by_se_value(beta_top: list["Article"]) -> list["Article"]:
+    """β通過記事を score_se_value.sh に渡し、α判定で上位を選定して返す。
+    失敗時は β スコア順の上位 ALPHA_FINAL_N 件をそのまま返す（フォールバック）。"""
+    fallback = beta_top[:ALPHA_FINAL_N]
+    if not beta_top:
+        return fallback
+    if not ALPHA_SCRIPT.exists():
+        print(f"[daily-digest] [WARN] α: {ALPHA_SCRIPT} が無い → β順で代替", flush=True)
+        return fallback
+
+    prompt = build_alpha_prompt(beta_top)
+    try:
+        proc = subprocess.run(
+            [str(ALPHA_SCRIPT)],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=ALPHA_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        print("[daily-digest] [WARN] α: タイムアウト → β順で代替", flush=True)
+        return fallback
+    except Exception as e:
+        print(f"[daily-digest] [WARN] α: 実行失敗({e}) → β順で代替", flush=True)
+        return fallback
+
+    if proc.returncode != 0:
+        print(f"[daily-digest] [WARN] α: 異常終了(rc={proc.returncode}) → β順で代替", flush=True)
+        return fallback
+
+    raw = (proc.stdout or "").strip()
+    # 念のため、前後に紛れた説明文があっても最初の [ から最後の ] までを拾う
+    s, e = raw.find("["), raw.rfind("]")
+    if s != -1 and e != -1 and e > s:
+        raw = raw[s : e + 1]
+    try:
+        ranking = json.loads(raw)
+    except Exception as ex:
+        print(f"[daily-digest] [WARN] α: JSON parse 失敗({ex}) → β順で代替", flush=True)
+        return fallback
+
+    # id(1始まり) → Article に rank/reason を反映
+    selected: list[Article] = []
+    for item in sorted(ranking, key=lambda r: r.get("rank", 999)):
+        idx = item.get("id", 0) - 1
+        if 0 <= idx < len(beta_top):
+            art = beta_top[idx]
+            art.se_rank = item.get("rank", 0)
+            art.se_reason = str(item.get("reason", "")).strip()
+            selected.append(art)
+
+    if not selected:
+        print("[daily-digest] [WARN] α: 有効な選定ゼロ → β順で代替", flush=True)
+        return fallback
+
+    print(f"[daily-digest] α: {len(selected)}件を意味判定で選定", flush=True)
+    return selected[:ALPHA_FINAL_N]
 
 
 # ---------- 要約 ----------
@@ -606,13 +710,17 @@ def render_digest(
         lines.append("")
     for i, art in enumerate(top_articles, 1):
         summary = one_line_summary(art, 80)
-        reasons = " / ".join(art.score_reasons) if art.score_reasons else "（キーワード一致なし・基礎点のみ）"
-        lines.append(f"### {i}. {art.title}（スコア: {art.score}）")
+        lines.append(f"### {i}. {art.title}")
         lines.append(f"- URL: {art.source_url}")
         if art.genre:
             lines.append(f"- ジャンル: {art.genre}")
         lines.append(f"- 要約: {summary}")
-        lines.append(f"- スコア理由: {reasons}")
+        if art.se_reason:
+            lines.append(f"- SE価値: {art.se_reason}")
+        else:
+            # α が使えなかった場合のフォールバック表示（従来のキーワード理由）
+            kw = " / ".join(art.score_reasons) if art.score_reasons else "（基礎点のみ）"
+            lines.append(f"- スコア理由（β）: {kw}")
         lines.append("")
 
     lines.append("## ブログ記事ネタの候補（3件）")
@@ -697,7 +805,8 @@ def main() -> int:
         score_article(art, profile)
 
     articles_sorted = sorted(articles, key=lambda a: a.score, reverse=True)
-    top5 = articles_sorted[:5]
+    beta_top = articles_sorted[:ALPHA_BETA_TOP_N]   # β足切り（上位12）
+    top5 = rank_by_se_value(beta_top)               # α判定（失敗時はβ順上位5）
     ideas = pick_blog_ideas(articles_sorted, n=3)
 
     sheets, sheet_mode = gather_idea_sheets(
