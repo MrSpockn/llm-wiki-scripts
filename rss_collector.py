@@ -56,6 +56,14 @@ FEEDS: dict[str, list[FeedSpec]] = {
         "https://zenn.dev/topics/generativeai/feed",
         "https://qiita.com/tags/llm/feed",
         "https://buttondown.com/anthropicnews/rss",
+        "https://openai.com/news/rss.xml",
+        "https://huggingface.co/blog/feed.xml",
+        "https://blog.google/innovation-and-ai/technology/ai/rss/",
+        "https://deepmind.google/blog/rss.xml",
+    ],
+    "個人開発・自動化": [
+        "https://www.publickey1.jp/atom.xml",
+        "https://b.hatena.ne.jp/hotentry/it.rss",
     ],
     "エンジニア副業・収益化": [
         "https://zenn.dev/topics/副業/feed",
@@ -65,11 +73,13 @@ FEEDS: dict[str, list[FeedSpec]] = {
     "金融リテラシー・投資": [
         ("https://www3.nhk.or.jp/rss/news/cat5.xml", 5),
         ("https://assets.wor.jp/rss/rdf/reuters/top.rdf", 5),
+        "https://assets.wor.jp/rss/rdf/nikkei/economy.rdf",
     ],
 }
 
 GENRE_TAGS: dict[str, list[str]] = {
     "生成AI・LLM最新動向": ["生成AI", "LLM"],
+    "個人開発・自動化": ["個人開発", "自動化"],
     "エンジニア副業・収益化": ["副業", "エンジニア"],
     "金融リテラシー・投資": ["金融", "投資"],
 }
