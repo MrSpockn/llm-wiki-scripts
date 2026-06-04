@@ -12,6 +12,7 @@ Daily Digest Generator
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -44,7 +45,16 @@ ALPHA_BETA_TOP_N = 12         # β足切り：αに渡す上位件数
 ALPHA_FINAL_N = 5             # α が選ぶ最終件数
 ALPHA_SCRIPT = HOME / "my-scripts" / "score_se_value.sh"
 ALPHA_BODY_CHARS = 300        # 各記事の本文をプロンプトに載せる際の冒頭文字数
-ALPHA_TIMEOUT_SEC = 180       # score_se_value.sh のタイムアウト
+ALPHA_TIMEOUT_SEC = 180       # score_se_value.sh のタイムアウト（subprocess方式）
+
+# --- α実行モード切替（bridge / subprocess / off）---
+# 緊急時は環境変数 ALPHA_MODE で即切替可能。off は α を呼ばず即 β（最終退避）。
+ALPHA_MODE = os.environ.get("ALPHA_MODE", "subprocess")
+# bridge 方式（gui/LaunchAgent + WatchPaths 経由）の待機設定
+ALPHA_BRIDGE_DIR = HOME / "my-scripts" / "alpha-bridge"
+# WatchPaths 発火 + claude 起動の余裕を加味（単体検証では実測 ~12s）。
+ALPHA_BRIDGE_TIMEOUT_SEC = ALPHA_TIMEOUT_SEC + 30
+ALPHA_BRIDGE_POLL_SEC = 1.0   # レスポンス出現のポーリング間隔（秒）
 
 
 # ---------- データ ----------
@@ -237,9 +247,11 @@ def build_alpha_prompt(articles: list["Article"]) -> str:
     return header + "\n\n".join(blocks) + "\n"
 
 
-def rank_by_se_value(beta_top: list["Article"]) -> list["Article"]:
-    """β通過記事を score_se_value.sh に渡し、α判定で上位を選定して返す。
-    失敗時は β スコア順の上位 ALPHA_FINAL_N 件をそのまま返す（フォールバック）。"""
+def rank_by_se_value_subprocess(beta_top: list["Article"]) -> list["Article"]:
+    """【温存・従来方式】β通過記事を score_se_value.sh に渡し、α判定で上位を選定して返す。
+    失敗時は β スコア順の上位 ALPHA_FINAL_N 件をそのまま返す（フォールバック）。
+    ※ cron 無人実行では claude が keychain に到達できず失敗する既知問題あり。
+       bridge 方式（rank_by_se_value_bridge）への切替が本命。緊急時の退避用に残置。"""
     fallback = beta_top[:ALPHA_FINAL_N]
     if not beta_top:
         return fallback
@@ -294,6 +306,115 @@ def rank_by_se_value(beta_top: list["Article"]) -> list["Article"]:
 
     print(f"[daily-digest] α: {len(selected)}件を意味判定で選定", flush=True)
     return selected[:ALPHA_FINAL_N]
+
+
+def _parse_alpha_result(data, beta_top: list["Article"]) -> list["Article"]:
+    """α応答(JSON配列)を現行 subprocess 版と同一ロジックで id→記事 に解決する。
+    rank 昇順に並べ、id(1始まり) → beta_top[id-1] に rank/reason を反映。
+    不正な要素は黙ってスキップ（呼び出し側の try/except と合わせ digest を止めない）。"""
+    selected: list[Article] = []
+    if not isinstance(data, list):
+        return selected
+
+    def _rank_key(r):
+        return r.get("rank", 999) if isinstance(r, dict) else 999
+
+    for item in sorted(data, key=_rank_key):
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("id", 0) - 1
+        if 0 <= idx < len(beta_top):
+            art = beta_top[idx]
+            art.se_rank = item.get("rank", 0)
+            art.se_reason = str(item.get("reason", "")).strip()
+            selected.append(art)
+    return selected[:ALPHA_FINAL_N]
+
+
+def _cleanup_bridge(req_id: str) -> None:
+    """自分の req_id の残骸のみを requests/responses/processing から削除する。
+    他 ID のファイルには一切触れない（前日残骸の誤読防止と対）。"""
+    targets = [
+        ALPHA_BRIDGE_DIR / "requests" / f"{req_id}.prompt",
+        ALPHA_BRIDGE_DIR / "requests" / f".{req_id}.prompt.tmp",
+        ALPHA_BRIDGE_DIR / "responses" / f"{req_id}.json",
+        ALPHA_BRIDGE_DIR / "responses" / f".{req_id}.json.tmp",
+        ALPHA_BRIDGE_DIR / "processing" / f"{req_id}.prompt",
+    ]
+    for p in targets:
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+
+def rank_by_se_value_bridge(beta_top: list["Article"]) -> list["Article"]:
+    """【本命】β通過記事を alpha-bridge（gui/LaunchAgent + WatchPaths）経由で α判定する。
+    リクエスト配置→待機→JSON読込のどの段階で何が起きても、例外を出さず必ず
+    fallback（β順上位 ALPHA_FINAL_N）を返す。α は失敗してよいが digest は絶対に止めない。"""
+    fallback = beta_top[:ALPHA_FINAL_N]
+    if not beta_top:
+        return fallback
+
+    req_dir = ALPHA_BRIDGE_DIR / "requests"
+    res_dir = ALPHA_BRIDGE_DIR / "responses"
+    req_id = None
+    try:
+        if not req_dir.is_dir() or not res_dir.is_dir():
+            print("[daily-digest] [WARN] α: bridge ディレクトリ無し → β順で代替", flush=True)
+            return fallback
+
+        prompt = build_alpha_prompt(beta_top)            # 既存関数・不変更
+        req_id = f"{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"
+
+        # アトミック配置：.tmp に書いてから rename（書き込み途中をブリッジが拾わない）
+        tmp = req_dir / f".{req_id}.prompt.tmp"
+        tmp.write_text(prompt, encoding="utf-8")
+        tmp.rename(req_dir / f"{req_id}.prompt")          # ここで WatchPaths 発火
+
+        # 上限つき待機（monotonic 基準・自分の ID のレスポンスだけを見る）
+        res_path = res_dir / f"{req_id}.json"
+        deadline = time.monotonic() + ALPHA_BRIDGE_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            if res_path.exists():
+                break
+            time.sleep(ALPHA_BRIDGE_POLL_SEC)
+        else:
+            print(
+                f"[daily-digest] [WARN] α: タイムアウト({ALPHA_BRIDGE_TIMEOUT_SEC}s) → β順で代替 (id={req_id})",
+                flush=True,
+            )
+            _cleanup_bridge(req_id)
+            return fallback
+
+        # レスポンス読込 & JSON 妥当性検証（digest の責務）
+        raw = res_path.read_text(encoding="utf-8")
+        data = json.loads(raw)                            # 非JSON散文ならここで例外 → except
+        top5 = _parse_alpha_result(data, beta_top)        # 構造検証 + id→記事 の解決
+        if not top5:                                      # 選定ゼロも β 代替
+            print("[daily-digest] [WARN] α: 選定ゼロ → β順で代替", flush=True)
+            _cleanup_bridge(req_id)
+            return fallback
+
+        print(f"[daily-digest] α: {len(top5)}件を意味判定で選定", flush=True)  # 成功マーカー
+        _cleanup_bridge(req_id)
+        return top5
+
+    except json.JSONDecodeError:
+        print("[daily-digest] [WARN] α: 非JSON応答 → β順で代替", flush=True)
+        if req_id:
+            _cleanup_bridge(req_id)
+        return fallback
+    except Exception as e:
+        print(f"[daily-digest] [WARN] α: 例外({type(e).__name__}) → β順で代替", flush=True)
+        try:
+            if req_id:
+                _cleanup_bridge(req_id)
+        except Exception:
+            pass
+        return fallback
 
 
 # ---------- 要約 ----------
@@ -806,7 +927,13 @@ def main() -> int:
 
     articles_sorted = sorted(articles, key=lambda a: a.score, reverse=True)
     beta_top = articles_sorted[:ALPHA_BETA_TOP_N]   # β足切り（上位12）
-    top5 = rank_by_se_value(beta_top)               # α判定（失敗時はβ順上位5）
+    # α判定（失敗時はβ順上位5）。ALPHA_MODE で方式を切替・即ロールバック可。
+    if ALPHA_MODE == "bridge":
+        top5 = rank_by_se_value_bridge(beta_top)        # 本命：gui/LaunchAgent経由
+    elif ALPHA_MODE == "subprocess":
+        top5 = rank_by_se_value_subprocess(beta_top)    # 温存：従来のsubprocess方式
+    else:
+        top5 = beta_top[:ALPHA_FINAL_N]                 # off：αを呼ばず即β（最終退避）
     ideas = pick_blog_ideas(articles_sorted, n=3)
 
     sheets, sheet_mode = gather_idea_sheets(

@@ -34,6 +34,7 @@ OUTPUTS_DIR = WIKI_ROOT / "outputs"
 WIKI_DIR = WIKI_ROOT / "wiki"
 CONCEPTS_DIR = WIKI_DIR / "concepts"
 INTEREST_PROFILE = WIKI_ROOT / "interest_profile.md"
+RSS_LOG = HOME / "my-scripts" / "rss_collector.log"  # 死活監視の集計元（compile/α の成否）
 
 # ジャンル別トップ表示の上限（合計 10 件）
 TOTAL_TOP_ARTICLES = 10
@@ -301,6 +302,59 @@ def _date_to_ts(d: date) -> float:
 
 # ---------- 出力 ----------
 
+def collect_health_log(week: WeekRange) -> dict:
+    """rss_collector.log から当週(月〜日)の自動処理の成否を集計する（読むだけ）。
+    α成功行「α: N件を意味判定で選定」には日付が無いため、直近の日付付き行
+    （[daily-digest] 対象日: や [compile] 行）から日付コンテキストを引き継いで判定する。"""
+    health = {
+        "ok": False,
+        "alpha_success": 0,
+        "alpha_warn": 0,
+        "warn_breakdown": {"タイムアウト": 0, "非JSON": 0, "例外": 0, "選定ゼロ": 0, "その他": 0},
+        "compile_ok": 0,
+        "compile_runs": 0,
+    }
+    if not RSS_LOG.exists():
+        return health
+    try:
+        text = RSS_LOG.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return health
+
+    date_re = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+    cur: Optional[date] = None
+    for line in text.splitlines():
+        m = date_re.search(line)
+        if m:
+            try:
+                cur = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                pass
+        if cur is None or not (week.monday <= cur <= week.sunday):
+            continue
+        if "[compile]" in line and "終了" in line:
+            health["compile_runs"] += 1
+            if "exit=0" in line:
+                health["compile_ok"] += 1
+        elif "件を意味判定で選定" in line:
+            health["alpha_success"] += 1
+        elif "[WARN] α" in line:
+            health["alpha_warn"] += 1
+            bd = health["warn_breakdown"]
+            if "タイムアウト" in line:
+                bd["タイムアウト"] += 1
+            elif "非JSON" in line or "JSON parse" in line:
+                bd["非JSON"] += 1
+            elif "例外" in line or "実行失敗" in line:
+                bd["例外"] += 1
+            elif "選定ゼロ" in line:
+                bd["選定ゼロ"] += 1
+            else:
+                bd["その他"] += 1  # subprocess版の「異常終了(rc=)」等
+    health["ok"] = True
+    return health
+
+
 def render_report(
     week: WeekRange,
     today: date,
@@ -410,6 +464,35 @@ def render_report(
     else:
         for c in lint.new_unlinked:
             lines.append(f"- [[{c.path.stem}]] — {c.description}")
+    lines.append("")
+
+    # 5. 自動処理 死活状況（rss_collector.log 集計・読むだけ）。集計失敗でも本体は壊さない。
+    lines.append("## 5. 自動処理 死活状況（今週）")
+    lines.append("")
+    try:
+        h = collect_health_log(week)
+        if not h["ok"]:
+            lines.append("- ⚠️ ログ未取得（rss_collector.log が読めず集計不可）")
+        else:
+            if h["compile_runs"] == 0:
+                lines.append("- 🔴 **compile: 今週の実行記録なし**（静かに停止している可能性。要確認）")
+            else:
+                lines.append(f"- compile（wiki化）: 成功 {h['compile_ok']}/{h['compile_runs']} 回")
+            if h["alpha_success"] == 0:
+                lines.append(
+                    f"- 🟡 **α（SE価値判定）: 今週の成功ゼロ**"
+                    f"（β順フォールバックで代替中・失敗 {h['alpha_warn']} 回）"
+                )
+            else:
+                lines.append(
+                    f"- α（SE価値判定）: 成功 {h['alpha_success']} 回 / 失敗 {h['alpha_warn']} 回"
+                )
+            if h["alpha_warn"]:
+                detail = " / ".join(f"{k}={v}" for k, v in h["warn_breakdown"].items() if v)
+                if detail:
+                    lines.append(f"  - α失敗内訳: {detail}")
+    except Exception as e:
+        lines.append(f"- ⚠️ 死活集計をスキップ（{type(e).__name__}）")
     lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
