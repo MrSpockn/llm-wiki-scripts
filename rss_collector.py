@@ -112,22 +112,48 @@ def entry_date(entry) -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-def entry_body_markdown(entry) -> str:
-    """entry の本文（HTMLがあれば Markdown に変換）を返す。"""
-    html = ""
-    if getattr(entry, "content", None):
-        try:
-            html = entry.content[0].value
-        except Exception:
-            html = ""
-    if not html:
-        html = getattr(entry, "summary", "") or ""
+def _markdownify(html: str) -> str:
+    """HTML を Markdown 化する。失敗時は素の文字列を返す。"""
     if not html:
         return ""
     try:
         return md(html, heading_style="ATX").strip()
     except Exception:
         return html.strip()
+
+
+_BODY_DECORATION = re.compile(r"[#*_`>\-\[\]()!~|+=\s]+")
+
+
+def _effective_len(markdown_text: str) -> int:
+    """Markdown 装飾・空白を除いた実質文字数を返す（本文選択の比較用）。"""
+    return len(_BODY_DECORATION.sub("", markdown_text))
+
+
+def entry_body_markdown(entry) -> str:
+    """entry の本文を返す。
+
+    content と summary の両方を Markdown 化し、実質文字数（装飾・空白を除いた
+    長さ）が大きい方を本文として採用する。どちらも空なら空文字を返す。
+    """
+    content_html = ""
+    if getattr(entry, "content", None):
+        try:
+            content_html = entry.content[0].value
+        except Exception:
+            content_html = ""
+    summary_html = getattr(entry, "summary", "") or ""
+
+    content_md = _markdownify(content_html)
+    summary_md = _markdownify(summary_html)
+
+    if not content_md and not summary_md:
+        return ""
+
+    # 同点時は従来どおり content を優先（>=）。
+    if _effective_len(content_md) >= _effective_len(summary_md):
+        return content_md
+    return summary_md
 
 
 def yaml_escape(s: str) -> str:

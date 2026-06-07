@@ -56,6 +56,14 @@ ALPHA_BRIDGE_DIR = HOME / "my-scripts" / "alpha-bridge"
 ALPHA_BRIDGE_TIMEOUT_SEC = ALPHA_TIMEOUT_SEC + 30
 ALPHA_BRIDGE_POLL_SEC = 1.0   # レスポンス出現のポーリング間隔（秒）
 
+# ---------- 本文補完（薄い記事のみ記事HTMLから取得）設定 ----------
+# β足切り後・α判定前に、本文が薄い記事だけ元記事HTMLを取りに行って本文を補う。
+# trafilatura が import 不可/取得失敗/抽出ゼロ でも digest は止めない（黙ってスキップ）。
+BODY_FETCH_THRESHOLD = 300    # 本文実質文字数がこれ未満なら記事HTMLを取りに行く
+BODY_FETCH_TIMEOUT_SEC = 15   # 1記事あたりタイムアウト（秒）
+BODY_FETCH_MAX = 12           # フェッチ対象上限（β通過分のみ）
+BODY_FETCH_SLEEP_SEC = 1.0    # フェッチ間スリープ（対象サイトへの礼儀）
+
 
 # ---------- データ ----------
 
@@ -417,6 +425,104 @@ def rank_by_se_value_bridge(beta_top: list["Article"]) -> list["Article"]:
         return fallback
 
 
+# ---------- 本文補完（薄い記事のみ記事HTMLから取得） ----------
+
+_DOMAIN_RE = re.compile(r"https?://([^/]+)", re.IGNORECASE)
+
+
+def _domain_of(url: str) -> str:
+    m = _DOMAIN_RE.match(url or "")
+    return m.group(1).lower() if m else "(unknown)"
+
+
+def enrich_beta_top_bodies(
+    beta_top: list["Article"], profile: InterestProfile
+) -> list["Article"]:
+    """β足切り後・α判定前に、本文が薄い記事だけ元記事HTMLから本文を補完する。
+
+    - 実質文字数が BODY_FETCH_THRESHOLD 未満の記事のみ対象（最大 BODY_FETCH_MAX 件）。
+    - trafilatura.fetch_url → extract で本文抽出し、既存より長ければ art.body を差し替え再スコア。
+    - import 不可 / 取得失敗 / タイムアウト / 抽出None / 抽出が既存以下 は元の本文のまま（スキップ）。
+    - trafilatura が無い・落ちる環境でも digest を絶対に止めない（既存フォールバック思想に倣う）。
+
+    beta_top の Article を in-place で更新し、同じリストを返す（順序・要素は不変）。"""
+    try:
+        import trafilatura
+    except Exception:
+        print(
+            "[daily-digest] 本文補完: trafilatura 利用不可 → スキップ（digest続行）",
+            flush=True,
+        )
+        return beta_top
+
+    # 1記事あたりのダウンロードタイムアウトを設定（失敗してもデフォルトで続行）。
+    cfg = None
+    try:
+        from trafilatura.settings import use_config
+        cfg = use_config()
+        cfg.set("DEFAULT", "DOWNLOAD_TIMEOUT", str(BODY_FETCH_TIMEOUT_SEC))
+    except Exception:
+        cfg = None
+
+    # 対象選定：本文が薄く source_url を持つ記事を、β上位順に最大 MAX 件。
+    targets: list[Article] = []
+    for art in beta_top:
+        if not art.source_url:
+            continue
+        if _effective_body_len(art.body) < BODY_FETCH_THRESHOLD:
+            targets.append(art)
+        if len(targets) >= BODY_FETCH_MAX:
+            break
+
+    if not targets:
+        print("[daily-digest] 本文補完: 対象0件（薄い記事なし）", flush=True)
+        return beta_top
+
+    grown = 0
+    failed = 0
+    domain_gain: dict[str, int] = {}
+
+    for i, art in enumerate(targets):
+        if i > 0:
+            time.sleep(BODY_FETCH_SLEEP_SEC)  # 連続フェッチの礼儀
+        before_len = _effective_body_len(art.body)
+        dom = _domain_of(art.source_url)
+        try:
+            try:
+                downloaded = trafilatura.fetch_url(art.source_url, config=cfg) if cfg \
+                    else trafilatura.fetch_url(art.source_url)
+            except TypeError:
+                # 古い/新しい API 差異で config kwarg 非対応でも続行
+                downloaded = trafilatura.fetch_url(art.source_url)
+            if not downloaded:
+                failed += 1
+                continue
+            extracted = trafilatura.extract(downloaded) or ""
+        except Exception:
+            failed += 1
+            continue
+
+        after_len = _effective_body_len(extracted)
+        if extracted and after_len > before_len:
+            art.body = extracted.strip()
+            score_article(art, profile)  # 本文が変わったので β を再計算
+            grown += 1
+            domain_gain[dom] = domain_gain.get(dom, 0) + (after_len - before_len)
+        # 抽出が既存以下 / None は元の本文のまま（スキップ・加点も減点もしない）
+
+    print(
+        f"[daily-digest] 本文補完: 対象={len(targets)}件 "
+        f"伸びた={grown}件 失敗={failed}件（既存以下スキップ含む）",
+        flush=True,
+    )
+    if domain_gain:
+        parts = ", ".join(
+            f"{d} +{g}字" for d, g in sorted(domain_gain.items(), key=lambda x: -x[1])
+        )
+        print(f"[daily-digest] 本文補完(ドメイン別の伸び): {parts}", flush=True)
+    return beta_top
+
+
 # ---------- 要約 ----------
 
 def one_line_summary(art: Article, max_len: int = 80) -> str:
@@ -465,12 +571,18 @@ def build_idea(art: Article) -> dict:
     }
 
 
-def _has_enough_body(art: Article) -> bool:
-    # markdown 装飾・空白を除いた実質文字数で判定
-    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", art.body)
+def _effective_body_len(body: str) -> int:
+    """markdown 装飾・空白を除いた本文の実質文字数を返す。
+    本文補完の閾値判定・伸び計測と、ブログネタ採否判定で共通利用する。"""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body or "")
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"[#*_`>\-\s]+", "", text)
-    return len(text) >= MIN_BODY_LEN_FOR_IDEA
+    return len(text)
+
+
+def _has_enough_body(art: Article) -> bool:
+    # markdown 装飾・空白を除いた実質文字数で判定
+    return _effective_body_len(art.body) >= MIN_BODY_LEN_FOR_IDEA
 
 
 def pick_blog_ideas(articles: list[Article], n: int = 3) -> list[dict]:
@@ -927,6 +1039,9 @@ def main() -> int:
 
     articles_sorted = sorted(articles, key=lambda a: a.score, reverse=True)
     beta_top = articles_sorted[:ALPHA_BETA_TOP_N]   # β足切り（上位12）
+    # β通過後・α判定前：本文が薄い記事だけ元記事HTMLから本文を補完する。
+    # （trafilatura 不可・取得失敗でも黙ってスキップし digest は続行）
+    beta_top = enrich_beta_top_bodies(beta_top, profile)
     # α判定（失敗時はβ順上位5）。ALPHA_MODE で方式を切替・即ロールバック可。
     if ALPHA_MODE == "bridge":
         top5 = rank_by_se_value_bridge(beta_top)        # 本命：gui/LaunchAgent経由
